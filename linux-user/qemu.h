@@ -107,6 +107,44 @@ struct sync_signal {
   struct emulated_sigqueue event;
 };
 
+struct sigsuspend {
+  /* true if we're leaving a sigsuspend and sigsuspend_mask is valid. */
+  bool active;
+  // The original syscall number used to invoke sigsuspend.
+  int orig_syscall_num;
+  abi_ulong last_syscall_ret;
+};
+
+struct sigtimedwait_info {
+  /* True if a sigtimedwait syscall is in progress. This is used in
+   * process_pending_signals. */
+  bool in_progress;
+  
+  // XXX fixup, mux and notify_signal are used by the signal handler to notify the
+  // syscall emulation layer that a signal has been delivered. This is needed
+  // to avoid a potential race if `nanosleep` is used.
+  int eventfd;
+
+  // ran_signal_handler is used by process_pending_signals to notify the
+  // syscall emulation layer that a signal was handled since the last time
+  // we tried to emulate this syscall. This is needed to properly support
+  // EINTR handling.
+  int ran_signal_handler;
+
+  // For tracking in-progress timeouts
+  struct {
+    // Set to true if the original sigtimedwait call had a timespec. This is
+    // so we can distinguish between cases where no timeout is given.
+    bool exists;
+    // If "exists" is true, this is set to the original timespec given by
+    // the user.
+    struct timespec orig;
+    // If "exists" is true, this is set to the remaining time we are allowed to
+    // sleep for this sigtimedwait call.
+    struct timespec rem;
+  } timeout;
+}
+
 
 /* NOTE: we force a big alignment so that the stack stored after is
    aligned too */
@@ -160,8 +198,9 @@ typedef struct TaskState {
     target_sigset_t target_signal_mask;
     target_sigset_t target_sigsuspend_mask;
 #endif
-    /* Nonzero if we're leaving a sigsuspend and sigsuspend_mask is valid. */
-    int in_sigsuspend;
+
+    struct sigtimedwait_info sigtimedwait;
+    struct sigsuspend suspend;
 
     /* Nonzero if process_pending_signals() needs to do something (either
      * handle a pending signal or unblock signals).

@@ -5722,9 +5722,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         ts->bprm = parent_ts->bprm;
         ts->info = parent_ts->info;
         ts->signal_mask = parent_ts->signal_mask;
-#ifdef TRACK_TARGET_SIGMASK
         ts->target_signal_mask = parent_ts->target_signal_mask;
-#endif
 
         if (flags & CLONE_CHILD_CLEARTID) {
             ts->child_tidptr = child_tidptr;
@@ -6615,7 +6613,6 @@ static inline abi_long host_to_target_stat64(void *cpu_env,
 }
 #endif
 
-<<<<<<< HEAD
 #if defined(TARGET_NR_statx) && defined(__NR_statx)
 static inline abi_long host_to_target_statx(struct target_statx *host_stx,
                                             abi_ulong target_addr)
@@ -6657,7 +6654,6 @@ static inline abi_long host_to_target_statx(struct target_statx *host_stx,
 }
 #endif
 
-#ifdef MUX_SIG
 static inline int multiplex(abi_long *arg, siginfo_t *uinfo)
 {
     if (*arg >= _NSIG && *arg < TARGET_NSIG) {
@@ -6673,7 +6669,6 @@ static inline int multiplex(abi_long *arg, siginfo_t *uinfo)
 
     return 0;
 }
-#endif
 
 /* ??? Using host futex calls even when target atomic operations
    are not really atomic probably breaks things.  However implementing
@@ -6830,7 +6825,19 @@ static abi_long do_signalfd4(int fd, abi_long mask, int flags)
         return -TARGET_EFAULT;
     }
 
-    target_to_host_sigset(&host_mask, target_mask);
+    // If MUX_SIG is in the target_mask, then our implementation is incomplete
+    // so warn the user.
+    // TODO: implement signalfd support for MUX_SIG.
+    target_to_host_sigset(&host_mask, target_mask, SIGSET_UPPER_BOUND);
+    if (sigismember(&host_mask, MUX_SIG)) {
+      qemu_log("WARNING: signalfd is not fully implemented for this signal set.\n"
+               "         libc-reserved signals, signal %d, and any\n"
+               "         signals outside the host-range will not be delivered\n"
+               "         to this file-descriptor.\n", MUX_SIG);
+    }
+    sigemptyset(&host_mask);
+
+    target_to_host_sigset(&host_mask, target_mask, SIGSET_LOWER_BOUND);
 
     host_flags = target_to_host_bitmask(flags, fcntl_flags_tbl);
 
@@ -7788,42 +7795,41 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return get_errno(syncfs(arg1));
 #endif
     case TARGET_NR_kill:
-#ifdef MUX_SIG
-        if (arg2 >= _NSIG && arg2 < TARGET_NSIG) {
-            siginfo_t info;
+        {
+            int host_sig = target_to_host_signal(arg2);
+            if (host_sig == MUX_SIG) {
+                siginfo_t info;
 
-            info.si_errno = arg2;
-            info.si_signo = MUX_SIG;
-            info.si_code = SIG_SPOOF(SI_USER);
-            info.si_pid = getpid();
-            info.si_uid = getuid();
+                info.si_errno = arg2;
+                info.si_signo = MUX_SIG;
+                info.si_code = SIG_SPOOF(SI_USER);
+                info.si_pid = getpid();
+                info.si_uid = getuid();
 
-            /* pid > 0 */
-            if (arg1 > 0) {
-                return get_errno(sys_rt_sigqueueinfo(arg1, MUX_SIG, &info));
+                /* pid > 0 */
+                if (arg1 > 0) {
+                    return get_errno(sys_rt_sigqueueinfo(arg1, MUX_SIG, &info));
+                } else {
+                    return -TARGET_EINVAL;
+                }
+                /*
+                 * TODO: In order to implement kill with rt_tgsigqueueinfo() for
+                 * cases where pid <= 0 one needs to get a list of all the relevant
+                 * processes and simultaniously send the signal to them.
+                 * Missing:
+                 * (pid = 0):
+                 *     send to every process in the process group of
+                 *     the calling process
+                 * (pid = -1):
+                 *     send to every process for which the calling process
+                 *     has permission to send signals, except for process 1 (init)
+                 * (pid < -1):
+                 *     send to every process in the process group whose ID is -pid
+                 */
             } else {
-                return -TARGET_EINVAL;
+                return get_errno(safe_kill(arg1, host_sig));
             }
-            /*
-             * TODO: In order to implement kill with rt_tgsigqueueinfo() for
-             * cases where pid <= 0 one needs to get a list of all the relevant
-             * processes and simultaniously send the signal to them.
-             * Missing:
-             * (pid = 0):
-             *     send to every process in the process group of
-             *     the calling process
-             * (pid = -1):
-             *     send to every process for which the calling process
-             *     has permission to send signals, except for process 1 (init)
-             * (pid < -1):
-             *     send to every process in the process group whose ID is -pid
-             */
-        } else {
-            return get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
         }
-#else
-        return get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
-#endif
 #ifdef TARGET_NR_rename
     case TARGET_NR_rename:
         {
@@ -8159,53 +8165,27 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_NR_sgetmask /* not on alpha */
     case TARGET_NR_sgetmask:
         {
-#ifdef TRACK_TARGET_SIGMASK
-            sigset_t cur_set;
-            target_sigset_t target_set_mask;
+            target_sigset_t target_mask;
             abi_ulong target_set;
-            ret = do_target_sigprocmask(0, NULL, &target_set_mask,
-                                        NULL, &cur_set);
+            ret = do_target_sigprocmask(0, NULL, &target_mask);
             if (!ret) {
-                target_to_abi_ulong_old_sigset(&target_set, &target_set_mask);
+                target_to_abi_ulong_old_sigset(&target_set, &target_mask);
                 ret = target_set;
             }
-#else
-            sigset_t cur_set;
-            abi_ulong target_set;
-            ret = do_sigprocmask(0, NULL, &cur_set);
-            if (!ret) {
-                host_to_target_old_sigset(&target_set, &cur_set);
-                ret = target_set;
-            }
-#endif
         }
         return ret;
 #endif
 #ifdef TARGET_NR_ssetmask /* not on alpha */
     case TARGET_NR_ssetmask:
         {
-#ifdef TRACK_TARGET_SIGMASK
-            sigset_t set, oset;
-            target_sigset_t target_set_mask, target_oset;
+            target_sigset_t target_mask, target_oset;
             abi_ulong target_set = arg1;
-            target_to_host_old_sigset(&set, &target_set);
             abi_ulong_to_target_old_sigset(&target_set_mask, &target_set);
-            ret = do_target_sigprocmask(SIG_SETMASK, &target_set_mask,
-                                        &target_oset, &set, &oset);
+            ret = do_target_sigprocmask(SIG_SETMASK, &target_mask, &target_oset);
             if (!ret) {
                 target_to_abi_ulong_old_sigset(&target_set, &target_oset);
                 ret = target_set;
             }
-#else
-            sigset_t set, oset;
-            abi_ulong target_set = arg1;
-            target_to_host_old_sigset(&set, &target_set);
-            ret = do_sigprocmask(SIG_SETMASK, &set, &oset);
-            if (!ret) {
-                host_to_target_old_sigset(&target_set, &oset);
-                ret = target_set;
-            }
-#endif
         }
         return ret;
 #endif
@@ -8213,10 +8193,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_sigprocmask:
         {
 #if defined(TARGET_ALPHA)
-            sigset_t set, oldset;
-#ifdef TRACK_TARGET_SIGMASK
-            target_sigset_t target_set, target_oldset;
-#endif
+            target_sigset_t set, oldset;
             abi_ulong mask;
             int how;
 
@@ -8234,28 +8211,16 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 return -TARGET_EINVAL;
             }
             mask = arg2;
-            target_to_host_old_sigset(&set, &mask);
+            abi_ulong_to_target_old_sigset(&set, &mask);
 
-#ifdef TRACK_TARGET_SIGMASK
-            abi_ulong_to_target_old_sigset(&target_set, &mask);
-
-            ret = do_target_sigprocmask(how, &target_set, &target_oldset,
-                                        &set, &oldset);
+            ret = do_target_sigprocmask(how, &set, &oldset);
             if (!is_error(ret)) {
-                target_to_abi_ulong_old_sigset(&mask, &target_oldset);
-#else
-            ret = do_sigprocmask(how, &set, &oldset);
-            if (!is_error(ret)) {
-                host_to_target_old_sigset(&mask, &oldset);
-#endif
+                target_to_abi_ulong_old_sigset(&mask, &oldset);
                 ret = mask;
                 ((CPUAlphaState *)cpu_env)->ir[IR_V0] = 0; /* force no error */
             }
 #else
-            sigset_t set, oldset, *set_ptr;
-#ifdef TRACK_TARGET_SIGMASK
-            target_sigset_t target_set, target_oldset, *target_set_ptr;
-#endif
+            target_sigset_t set, oldset, *set_ptr;
             int how;
 
             if (arg2) {
@@ -8274,46 +8239,27 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 }
                 if (!(p = lock_user(VERIFY_READ, arg2, sizeof(target_sigset_t), 1)))
                     return -TARGET_EFAULT;
-                target_to_host_old_sigset(&set, p);
-#ifdef TRACK_TARGET_SIGMASK
-                abi_ulong_to_target_old_sigset(&target_set, p);
-                target_set_ptr = &target_set;
-#endif
-                unlock_user(p, arg2, 0);
+                abi_ulong_to_target_old_sigset(&set, p);
                 set_ptr = &set;
+                unlock_user(p, arg2, 0);
             } else {
                 how = 0;
                 set_ptr = NULL;
-#ifdef TRACK_TARGET_SIGMASK
-                target_set_ptr = NULL;
             }
-            ret = do_target_sigprocmask(how, target_set_ptr, &target_oldset,
-                                        set_ptr, &oldset);
-#else
-            }
-            ret = do_sigprocmask(how, set_ptr, &oldset);
-#endif
+            ret = do_target_sigprocmask(how, set_ptr, &oldset);
             if (!is_error(ret) && arg3) {
                 if (!(p = lock_user(VERIFY_WRITE, arg3, sizeof(target_sigset_t), 0)))
                     return -TARGET_EFAULT;
-#ifdef TRACK_TARGET_SIGMASK
-                target_to_abi_ulong_old_sigset(p, &target_oldset);
-#else
-                host_to_target_old_sigset(p, &oldset);
-#endif
+                target_to_abi_ulong_old_sigset(p, &oldset);
                 unlock_user(p, arg3, sizeof(target_sigset_t));
             }
-#endif
         }
         return ret;
 #endif
     case TARGET_NR_rt_sigprocmask:
         {
             int how = arg1;
-            sigset_t set, oldset, *set_ptr;
-#ifdef TRACK_TARGET_SIGMASK
-            target_sigset_t target_set, target_oldset, *target_set_ptr;
-#endif
+            target_sigset_t set, oldset, *set_ptr;
 
             if (arg4 != sizeof(target_sigset_t)) {
                 return -TARGET_EINVAL;
@@ -8335,33 +8281,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 }
                 if (!(p = lock_user(VERIFY_READ, arg2, sizeof(target_sigset_t), 1)))
                     return -TARGET_EFAULT;
-                target_to_host_sigset(&set, p);
-#ifdef TRACK_TARGET_SIGMASK
-                tswapal_target_sigset(&target_set, p);
-                target_set_ptr = &target_set;
-#endif
-                unlock_user(p, arg2, 0);
+                tswapal_target_sigset(&set, p);
                 set_ptr = &set;
+                unlock_user(p, arg2, 0);
             } else {
                 how = 0;
                 set_ptr = NULL;
-#ifdef TRACK_TARGET_SIGMASK
-                target_set_ptr = NULL;
             }
-            ret = do_target_sigprocmask(how, target_set_ptr, &target_oldset,
-                                        set_ptr, &oldset);
-#else
-            }
-            ret = do_sigprocmask(how, set_ptr, &oldset);
-#endif
+            ret = do_target_sigprocmask(how, set_ptr, &oldset);
             if (!is_error(ret) && arg3) {
                 if (!(p = lock_user(VERIFY_WRITE, arg3, sizeof(target_sigset_t), 0)))
                     return -TARGET_EFAULT;
-#ifdef TRACK_TARGET_SIGMASK
-                tswapal_target_sigset(p, &target_oldset);
-#else
-                host_to_target_sigset(p, &oldset);
-#endif
+                tswapal_target_sigset(p, &oldset);
                 unlock_user(p, arg3, sizeof(target_sigset_t));
             }
         }
@@ -8408,21 +8339,32 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             TaskState *ts = cpu->opaque;
 #if defined(TARGET_ALPHA)
             abi_ulong mask = arg1;
-            target_to_host_old_sigset(&ts->sigsuspend_mask, &mask);
-#ifdef TRACK_TARGET_SIGMASK
             abi_ulong_to_target_old_sigset(&ts->target_sigsuspend_mask, &mask);
-#endif
-#else
+
             if (!(p = lock_user(VERIFY_READ, arg1, sizeof(target_sigset_t), 1)))
                 return -TARGET_EFAULT;
-            target_to_host_old_sigset(&ts->sigsuspend_mask, p);
-#ifdef TRACK_TARGET_SIGMASK
+
             abi_ulong_to_target_old_sigset(&ts->target_sigsuspend_mask, p);
-#endif
             unlock_user(p, arg1, 0);
 #endif
-            ret = get_errno(safe_rt_sigsuspend(&ts->sigsuspend_mask,
-                                               SIGSET_T_SIZE));
+            // For sigsuspend, we actually want to suspend until we receive a
+            // signal in the target sigset. However, the target sigset may
+            // contain signals outside of the host range, or other multiplexed
+            // signals. In that case, we actually want to suspend on the
+            // multiplex signal instead. So, convert the target sigsuspend mask
+            // into a host sigsuspend mask, and wait on that.
+            // 
+            // TODO:
+            // This is an overly conservative mask, we may end up preventing
+            // the delivery of other multiplexed signals not in the target
+            // sigmask, which could in severe cases end up live-locking the
+            // emulated program, if it can't receive the signals it is waiting
+            // for to change its pending state.. The other alternative is to
+            // not ever mask MUX_SIG, but this would require breaking (or
+            // properly handling) SI_QUEUE signals.
+            sigset_t host_mask;
+            target_to_host_sigset(&host_mask, &ts->target_sigsuspend_mask);
+            ret = get_errno(safe_rt_sigsuspend(&host_mask, SIGSET_T_SIZE));
             if (ret != -TARGET_ERESTARTSYS) {
                 ts->in_sigsuspend = 1;
             }
@@ -8438,13 +8380,27 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             }
             if (!(p = lock_user(VERIFY_READ, arg1, sizeof(target_sigset_t), 1)))
                 return -TARGET_EFAULT;
-            target_to_host_sigset(&ts->sigsuspend_mask, p);
-#ifdef TRACK_TARGET_SIGMASK
             tswapal_target_sigset(&ts->target_sigsuspend_mask, p);
-#endif
             unlock_user(p, arg1, 0);
-            ret = get_errno(safe_rt_sigsuspend(&ts->sigsuspend_mask,
-                                               SIGSET_T_SIZE));
+
+            // For sigsuspend, we actually want to suspend until we receive a
+            // signal in the target sigset. However, the target sigset may
+            // contain signals outside of the host range, or other multiplexed
+            // signals. In that case, we actually want to suspend on the
+            // multiplex signal instead. So, convert the target sigsuspend mask
+            // into a host sigsuspend mask, and wait on that.
+            // 
+            // TODO:
+            // This is an overly conservative mask, we may end up preventing
+            // the delivery of other multiplexed signals not in the target
+            // sigmask, which could in severe cases end up live-locking the
+            // emulated program, if it can't receive the signals it is waiting
+            // for to change its pending state.. The other alternative is to
+            // not ever mask MUX_SIG, but this would require breaking (or
+            // properly handling) SI_QUEUE signals.
+            sigset_t host_mask;
+            target_to_host_sigset(&host_mask, &ts->target_sigsuspend_mask);
+            ret = get_errno(safe_rt_sigsuspend(&host_mask, SIGSET_T_SIZE));
             if (ret != -TARGET_ERESTARTSYS) {
                 ts->in_sigsuspend = 1;
             }
@@ -8452,9 +8408,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return ret;
     case TARGET_NR_rt_sigtimedwait:
         {
-            sigset_t set;
+            target_sigset_t set;
             struct timespec uts, *puts;
-            siginfo_t uinfo;
+            target_siginfo_t uinfo;
 
             if (arg4 != sizeof(target_sigset_t)) {
                 return -TARGET_EINVAL;
@@ -8462,7 +8418,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
             if (!(p = lock_user(VERIFY_READ, arg1, sizeof(target_sigset_t), 1)))
                 return -TARGET_EFAULT;
-            target_to_host_sigset(&set, p);
+            set = *p;
             unlock_user(p, arg1, 0);
             if (arg3) {
                 puts = &uts;
@@ -8470,8 +8426,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             } else {
                 puts = NULL;
             }
-            ret = get_errno(safe_rt_sigtimedwait(&set, &uinfo, puts,
-                                                 SIGSET_T_SIZE));
+            ret = do_sigtimedwait(&set &uinfo, puts);
             if (!is_error(ret)) {
                 if (arg2) {
                     p = lock_user(VERIFY_WRITE, arg2, sizeof(target_siginfo_t),
@@ -8479,10 +8434,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                     if (!p) {
                         return -TARGET_EFAULT;
                     }
-                    host_to_target_siginfo(p, &uinfo);
+                    tswap_siginfo(p, &uinfo);
                     unlock_user(p, arg2, sizeof(target_siginfo_t));
                 }
-                ret = host_to_target_signal(ret);
             }
         }
         return ret;
@@ -8496,9 +8450,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             }
             target_to_host_siginfo(&uinfo, p);
             unlock_user(p, arg3, 0);
-#ifdef MUX_SIG
             multiplex(&arg2, &uinfo);
-#endif
             ret = get_errno(sys_rt_sigqueueinfo(arg1, arg2, &uinfo));
         }
         return ret;
@@ -8512,9 +8464,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             }
             target_to_host_siginfo(&uinfo, p);
             unlock_user(p, arg4, 0);
-#ifdef MUX_SIG
             multiplex(&arg3, &uinfo);
-#endif
             ret = get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, arg3, &uinfo));
         }
         return ret;
@@ -10817,10 +10767,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         {
             abi_ulong mask;
             int how;
-            sigset_t set, oldset;
-#ifdef TRACK_TARGET_SIGMASK
             target_sigset_t target_set, target_oldset;
-#endif
 
             switch(arg1) {
             case TARGET_SIG_BLOCK:
@@ -10836,18 +10783,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 return -TARGET_EINVAL;
             }
             mask = arg2;
-            target_to_host_old_sigset(&set, &mask);
-#ifdef TRACK_TARGET_SIGMASK
             abi_ulong_to_target_old_sigset(&target_set, &mask);
-            ret = do_target_sigprocmask(how, &target_set, &target_oldset,
-                                        &set, &oldset);
+            ret = do_target_sigprocmask(how, &target_set, &target_oldset);
             if (!ret) {
                 target_to_abi_ulong_old_sigset(&mask, &target_oldset);
-#else
-            ret = do_sigprocmask(how, &set, &oldset);
-            if (!ret) {
-                host_to_target_old_sigset(&mask, &oldset);
-#endif
                 ret = mask;
             }
         }
@@ -11424,25 +11363,32 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         /*
          * TODO: In order to implement tkill with rt_sigqueueinfo() one needs
          * to get a list of all the threads with the specifiend tid and
-         * simultaniously send the signal to them.
+         * simultainously send the signal to them.
          */
+        // XXX: This is weird? Why can't we mux here?
         return get_errno(safe_tkill((int)arg1, target_to_host_signal(arg2)));
 
     case TARGET_NR_tgkill:
 #ifdef MUX_SIG
-        if (arg3 >= _NSIG && arg3 < TARGET_NSIG) {
-            siginfo_t info;
+        {
+            int host_sig = target_to_host_signal(arg3);
+            // Always multiplex, even if the target signal is not multiplexed
+            // itself (i.e. arg3 == MUX_SIG). This is so demuxing is consistent
+            // on the receiver.
+            if (host_sig == MUX_SIG) {
+                siginfo_t info;
 
-            info.si_errno = arg3;
-            info.si_signo = MUX_SIG;
-            info.si_code = SIG_SPOOF(SI_TKILL);
-            info.si_pid = getpid();
-            info.si_uid = getuid();
+                info.si_errno = arg3;
+                info.si_signo = MUX_SIG;
+                info.si_code = SIG_SPOOF(SI_TKILL);
+                info.si_pid = getpid();
+                info.si_uid = getuid();
 
-            return get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, MUX_SIG, &info));
-        } else {
-            return get_errno(safe_tgkill((int)arg1, (int)arg2,
-                             target_to_host_signal(arg3)));
+                return get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, MUX_SIG, &info));
+            } else {
+                return get_errno(safe_tgkill((int)arg1, (int)arg2,
+                                 host_sig));
+            }
         }
 #else
         return get_errno(safe_tgkill((int)arg1, (int)arg2,

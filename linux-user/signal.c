@@ -66,12 +66,6 @@ static uint8_t host_to_target_signal_table[_NSIG] = {
     [SIGPWR] = TARGET_SIGPWR,
     [SIGSYS] = TARGET_SIGSYS,
     /* next signals stay the same */
-    /* Nasty hack: Reverse SIGRTMIN and SIGRTMAX to avoid overlap with
-       host libpthread signals.  This assumes no one actually uses SIGRTMAX :-/
-       To fix this properly we need to do manual signal delivery multiplexed
-       over a single host signal.  */
-    [__SIGRTMIN] = __SIGRTMAX,
-    [__SIGRTMAX] = __SIGRTMIN,
 };
 static uint8_t target_to_host_signal_table[_NSIG];
 
@@ -84,6 +78,12 @@ int host_to_target_signal(int sig)
 
 int target_to_host_signal(int sig)
 {
+    /* Target signals outside the host range should get mapped to MUX_SIG. */
+    if (sig > _NSIG && sig <= TARGET_NSIG)
+        return MUX_SIG
+    /* glibc reserved signals should also be mutliplexed. */
+    if (sig == SIGRTMIN || sig == SIGRTMIN - 1)
+        return MUX_SIG
     if (sig < 0 || sig >= _NSIG)
         return sig;
     return target_to_host_signal_table[sig];
@@ -137,7 +137,7 @@ void host_to_target_sigset(target_sigset_t *d, const sigset_t *s)
     int i;
 
     host_to_target_sigset_internal(&d1, s);
-    for(i = 0;i < TARGET_NSIG_WORDS; i++)
+    for(i = 0; i < TARGET_NSIG_WORDS; i++)
         d->sig[i] = tswapal(d1.sig[i]);
 }
 
@@ -153,14 +153,42 @@ void target_to_host_sigset_internal(sigset_t *d,
     }
 }
 
-void target_to_host_sigset(sigset_t *d, const target_sigset_t *s)
+enum target_to_host_sigset_bound {
+  SIGSET_LOWER_BOUND,
+  SIGSET_UPPER_BOUND,
+};
+
+// There may not be a 1:1 mapping between target signals and host signals.
+// For example, some targets have an expanded set of signals, or a target may
+// use a signal that is also used by the emulator itself.
+//
+// In these cases, signals are *multiplexed* through MUX_SIG, and
+// `target_to_host_signal` returns the host MUX_SIG. This can be problematic
+// when constructing a host sigset from a target sigset. Under a naive
+// implementation, if the target includes any multiplexed signal, then MUX_SIG
+// will be included in the host sigset. However, this is rarely the correct
+// behavior. E.g., consider `sigprocmask`. If MUX_SIG is included, it may
+// prevent the target from receiving non-masked signals that are also
+// multiplexed.
+//
+// Therefore, this function offers a "bound" argument, allowing the user to
+// select if the generated sigset should be an "upper" (potentially containing
+// additional signals), or "lower" (potentially containing fewer signals) bound
+// on the target sigset.
+void target_to_host_sigset(sigset_t *d, const target_sigset_t *s, enum target_to_host_sigset_bound bound)
 {
     target_sigset_t s1;
     int i;
 
-    for(i = 0;i < TARGET_NSIG_WORDS; i++)
+    for(i = 0; i < TARGET_NSIG_WORDS; i++)
         s1.sig[i] = tswapal(s->sig[i]);
     target_to_host_sigset_internal(d, &s1);
+    if (bound == SIGSET_LOWER_BOUND) {
+      // TODO: Only exclude MUX_SIG when target sigset covers a fraction of
+      // the signals that are multiplexed. This is conservative, but it should
+      // always yield a lower bound.
+      sigdelset(d, MUX_SIG);
+    }
 }
 
 void host_to_target_old_sigset(abi_ulong *old_sigset,
@@ -172,7 +200,7 @@ void host_to_target_old_sigset(abi_ulong *old_sigset,
 }
 
 void target_to_host_old_sigset(sigset_t *sigset,
-                               const abi_ulong *old_sigset)
+                               const abi_ulong *old_sigset, enum target_to_host_sigset_bound bound)
 {
     target_sigset_t d;
     int i;
@@ -180,7 +208,7 @@ void target_to_host_old_sigset(sigset_t *sigset,
     d.sig[0] = *old_sigset;
     for(i = 1;i < TARGET_NSIG_WORDS; i++)
         d.sig[i] = 0;
-    target_to_host_sigset(sigset, &d);
+    target_to_host_sigset(sigset, &d, bound);
 }
 
 void target_to_abi_ulong_old_sigset(abi_ulong *old_sigset,
@@ -225,6 +253,223 @@ int block_signals(void)
     return atomic_xchg(&ts->signal_pending, 1);
 }
 
+int do_sigsuspend(CPUArchState* env) {
+    int ret;
+    sigset_t host_mask, set, old;
+
+    TaskState *ts = env_cpu(env)->opaque;
+
+    target_to_host_sigset(&host_mask, &ts->target_sigsuspend_mask, SIGSET_BOUND_LOWER);
+
+    if (block_signals()) {
+      return -TARGET_ERESTARTSYS;
+    }
+
+    // wait until we have a pending signal that is not masked by the sigsuspend
+    // mask.
+    while (!have_pending_signal_not_in_set(env, &ts->target_sigsuspend_mask)) {
+      sigsuspend(&host_mask);
+      if (errno != EINTR) {
+        ret = get_errno(errno);
+        goto exit_suspend;
+      }
+    }
+
+    ts->in_sigsuspend = 1;
+    ret = -TARGET_EFAULT;
+
+exit_suspend:
+
+    sigprocmask(SIG_SETMASK, &old, 0);
+    return ret;
+}
+
+// Perform a saturating a - b on the given timespecs, storing the result in "res".
+static void timespec_sat_sub(struct timespec *a, struct timespec* b, struct timespec* res) {
+  res->tv_sec = (b->tv_sec > a->tv_sec) ? 0 : (a->tv_sec - b->tv_sec);
+  res->tv_nsec = (b->tv_nsec > a->tv_nsec) ? 0 : (a->tv_nsec - b->tv_nsec);
+}
+
+static bool timespec_empty(struct timespec *a) {
+  return a->tv_sec == 0 && a->tv_nsec == 0;
+}
+
+// Perform a "sigtimedwait" for the given target signals.
+// This is a hard because the target signals do not map 1:1 with the
+// host signals (some signals are multipexed through MUX_SIG). If we do a
+// "sigtimedwait" syscall directly, we would either wait for too much
+// XXX: Consider doing this with sigtimedwait:
+//   1. mask all signals.
+//   2. sigtimedwait on the full sigset.
+//   3. once a signal is received, if it isn't a match, enqueue it,
+//      and return ERESTARTSYS.
+// This impl is nice because it still uses the regular signal handler, but
+// it may be more complicate than it needs to be (i.e. with eventfd and
+// whatnot)
+int do_sigtimedwait(CPUArchState *env, const target_sigset_t *set, target_siginfo_t *info, const struct timespec *timeout) {
+    int ret;
+    sigset_t host_set, host_old, empty_mask;
+
+    TaskState *ts = env_cpu(env)->opaque;
+
+    // 1. mask everything. Not using block_signals here, because we need to
+    // restore the mask before exiting the handler. 
+    sigfillset(&host_set);
+    sigprocmask(SIG_SETMASK, &host_set, &host_old);
+
+    // We're just starting a brand-new sigtimedwait call, initialize the
+    // tracking structures, and mark that a sigtimedwait is in-progress.
+    if (!ts->sigtimedwait.in_progress) {
+      ts->sigtimedwait.in_progress = true;
+      ts->sigtimedwait.eventfd = eventfd(0, EFD_CLOEXEC);
+      ts->sigtimedwait.ran_signal_handler = 0;
+      if (timeout) {
+        ts->sigtimedwait.timeout.exists = true;
+        ts->sigtimedwait.timeout.orig = *timeout;
+        ts->sigtimedwait.timeout.rem = *timeout;
+      } else {
+        ts->sigtimedwait.timeout.exists = false;
+      }
+    }
+
+    // If this flag is set, then we've run a signal handler since we came here
+    // last. If the user did not register the signal handler as SA_RESTART,
+    // then we should fail with EINTR.
+    if (ts->sigtimedwait.ran_signal_handler) {
+      struct target_sigaction* act =
+          &sigact_table[ts->sigtimedwait.ran_signal_handler - 1];
+      if (act->sa_flags & TARGET_SA_RESTART) {
+        ret = -TARGET_EINTR;
+        goto unmask_and_finish;
+      }
+    }
+
+    // Re-set the ran_signal_handler tracking.
+    ts->sigtimedwait.ran_signal_handler = 0;
+
+    // Check to see if we have a signal pending in "set". If we do, great!
+    // Pop it off and return it.
+    if (have_pending_sig_in_set(env, set)) {
+      struct emulated_sigqueue* event = NULL;
+
+      // Note: This should follow standard linux behavior, lower signals
+      // get returned before higher signals.
+      int sig;
+      for (sig = 1; sig <= TARGET_NSIG; sig++) {
+        if (!target_sigismember(set, sig))
+          continue;
+
+        // We've found a match! Pop a signal off the queue, and return it.
+        struct emulated_sigtable *k = &ts->sigtab[sig - 1];
+        event = QSIMPLEQ_FIRST(&k->queue);
+        QSIMPLEQ_REMOVE_HEAD(&k->queue, next);
+
+        *info = event->info;
+        event->used = false;
+        ret = sig;
+        goto unmask_and_finish;
+      }
+    }
+
+    // If both fields of the `timeout' are set to zero, then just poll for
+    // pending signals. If we've gotten here, we don't have any pending signals,
+    // so fail with EAGAIN.
+    if (timespec_empty(&ts->sigtimedwait.timeout.orig)) {
+      return -TARGET_EAGAIN;
+    }
+
+    // We couldn't find a signal to satisfy the user's request. We need to wait
+    // for a new signal, and try again (or timeout).
+
+    // This part is tricky. Right now, we have all signals masked, we need
+    // to atomically:
+    //  1. Unmask signals, and
+    //  2. Sleep for timeout increments (maybe forever).
+    // There is no easy syscall to do this (nanosleep is close, but not quite).
+    // Instead, we rely on a "eventfd" and ppoll, which allows us to atomically
+    // wait for an event, and set a signal mask. When a new sigtimedwait call
+    // is started, an `eventfd' is created. This fd is written to in the signal
+    // handler, so we can use "ppoll" to pause until either a signal is handled,
+    // or the user's timer runs out.
+
+    struct pollfd pfd = {
+      .fd = ts->sigtimedwait.eventfd,
+      .events = POLLIN,
+    };
+    struct timespec start, end, elapsed;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    if (ts->sigtimedwait.timeout.exists) {
+      ret = ppoll(&pfd, 1, &ts->sigtimedwait.timeout.rem, &host_old);
+    } else {
+      ret = ppoll(&pfd, 1, NULL, &host_old);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    if (ret < 0) {
+      // These syscalls are not returned by sigtimedwait, but they can be
+      // returned by ppoll. But they shouldn't happen.
+      switch (errno) {
+      case EFAULT:
+      case ENOMEM:
+      case EINVAL:
+        g_assert_unreachable();
+      default:
+        ret = get_errno(errno);
+        goto unmask_and_finish;
+      }
+    } else if (!ret) {
+      // ret == 0 (no FDs available) if we timed out, so we return EAGAIN.
+      ret = -TARGET_EAGAIN;
+      goto unmask_and_finish;
+    }
+
+    timespec_sat_sub(&end, &start, &elapsed);
+    timespec_sat_sub(&ts->sigtimedwait.timeout.rem, &elapsed, &ts->sigtimedwait.timeout.rem);
+    // Somehow we've waited for the whole timeout period, but ppoll didn't
+    // tell us. This shouldn't happen, but it's here for sanity.
+    if (timespec_empty(&ts->sigtimedwait.timeout.rem)) {
+      ret = -TARGET_EAGAIN;
+      goto unmask_and_finish;
+    }
+
+    // Re-set the eventfd counter.
+    char buf[8];
+    if (!read(ts->sigtimedwait.eventfd, buf, 8)) {
+      g_assert_unreachable();
+    }
+
+    // If we made it here, all signals should be masked. We know that a
+    // (host) signal was handled (which masks all signals) because the eventfd 
+    // was signaled. At this point we *may* have a signal to satisfy "set",
+    // or we may not. In the worst case, we just received an unmasked target
+    // signal, and we need to run the target signal handler (if we don't do
+    // this we may stall forever, because the signal we're waiting on could
+    // be generated by a target signal handler).
+    //
+    // We could re-check the queued signals, but it seems easier to just
+    // abort in all cases, and re-try after we've run through
+    // "process_pending_signals", potentially handling pending signals.
+    //
+    // Note: We leave signals masked here because the signal processing
+    // code expects it, and we're about to go there.
+
+    // 7. If we *do* run a signal handler, then we may need to return EINTR.
+    //    If we come back *without* hanlding a signal, or if the signal is
+    //    an SA_RESTART signal then we need to try waiting again, so just
+    //    do another run through the procedure.
+
+    // 7.a Note, it may have taken a while for us to run the signal handler,
+    //     we should take that time into account when doing our timed wait.
+    
+    return -TARGET_RESTARTSYS;
+
+unmask_and_finish:
+    sigprocmask(SIG_SETMASK, &host_set, &host_old);
+
+    ts->sigtimedwait.in_progress = false;
+    close(ts->sigtimedwait.eventfd)
+    return ret;
+}
+
 /* Wrapper for sigprocmask function
  * Emulates a sigprocmask in a safe way for the guest. Note that set and oldset
  * are host signal set, not guest ones. Returns -TARGET_ERESTARTSYS if
@@ -232,12 +477,12 @@ int block_signals(void)
  * 0 on success.
  * If set is NULL, this is guaranteed not to fail.
  */
-int do_sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+int do_target_sigprocmask(int how, const target_sigset_t *set, target_sigset_t *oldset)
 {
     TaskState *ts = (TaskState *)thread_cpu->opaque;
 
     if (oldset) {
-        *oldset = ts->signal_mask;
+        *target_oldset = ts->target_signal_mask;
     }
 
     if (set) {
@@ -249,80 +494,17 @@ int do_sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
 
         switch (how) {
         case SIG_BLOCK:
-            sigorset(&ts->signal_mask, &ts->signal_mask, set);
-            break;
-        case SIG_UNBLOCK:
-            for (i = 1; i <= NSIG; ++i) {
-                if (sigismember(set, i)) {
-                    sigdelset(&ts->signal_mask, i);
-                }
-            }
-            break;
-        case SIG_SETMASK:
-            ts->signal_mask = *set;
-            break;
-        default:
-            g_assert_not_reached();
-        }
-
-        /* Silently ignore attempts to change blocking status of KILL or STOP */
-        sigdelset(&ts->signal_mask, SIGKILL);
-        sigdelset(&ts->signal_mask, SIGSTOP);
-    }
-    return 0;
-}
-
-#ifdef TRACK_TARGET_SIGMASK
-int do_target_sigprocmask(int how, const target_sigset_t *target_set,
-                          target_sigset_t *target_oldset,
-                          const sigset_t *set, sigset_t *oldset)
-{
-    TaskState *ts = (TaskState *)thread_cpu->opaque;
-
-    if (target_oldset) {
-        *target_oldset = ts->target_signal_mask;
-    }
-    if (oldset) {
-        *oldset = ts->signal_mask;
-#ifdef MUX_SIG
-        /*
-         * The emulation of MUX_SIG being blocked is done using the
-         * target_signal_mask, so the status of MUX_SIG is taken from there.
-         */
-        if (target_sigismember(&ts->target_signal_mask, MUX_SIG) == 1) {
-            sigaddset(oldset, MUX_SIG);
-        }
-#endif
-    }
-
-    if (target_set && set) {
-        int i;
-
-        if (block_signals()) {
-            return -TARGET_ERESTARTSYS;
-        }
-
-        switch (how) {
-        case SIG_BLOCK:
-            target_sigorset(&ts->target_signal_mask, &ts->target_signal_mask,
-                            target_set);
-            sigorset(&ts->signal_mask, &ts->signal_mask, set);
+            target_sigorset(&ts->target_signal_mask, &ts->target_signal_mask, set);
             break;
         case SIG_UNBLOCK:
             for (i = 1; i <= TARGET_NSIG; ++i) {
-                if (target_sigismember(target_set, i) == 1) {
+                if (target_sigismember(set, i) == 1) {
                     target_sigdelset(&ts->target_signal_mask, i);
-                }
-            }
-            for (i = 1; i <= NSIG; ++i) {
-                if (sigismember(set, i) == 1) {
-                    sigdelset(&ts->signal_mask, i);
                 }
             }
             break;
         case SIG_SETMASK:
-            ts->target_signal_mask = *target_set;
-            ts->signal_mask = *set;
+            ts->target_signal_mask = *set;
             break;
         default:
             g_assert_not_reached();
@@ -331,48 +513,20 @@ int do_target_sigprocmask(int how, const target_sigset_t *target_set,
         /* Silently ignore attempts to change blocking status of KILL or STOP */
         target_sigdelset(&ts->target_signal_mask, SIGKILL);
         target_sigdelset(&ts->target_signal_mask, SIGSTOP);
-        sigdelset(&ts->signal_mask, SIGKILL);
-        sigdelset(&ts->signal_mask, SIGSTOP);
-#ifdef MUX_SIG
-        /*
-         * Since MUX_SIG is used for all the target signals out of the host
-         * range it must never be blocked on host. The emulation of MUX_SIG
-         * being blocked is done using the target_signal_mask. The status
-         * of MUX_SIG is taken form the target_signal_mask.
-         */
-        sigdelset(&ts->signal_mask, MUX_SIG);
-#endif
     }
     return 0;
 }
-#endif
 
 #if !defined(TARGET_NIOS2)
 /* Just set the guest's signal mask to the specified value; the
  * caller is assumed to have called block_signals() already.
  */
-#ifndef TRACK_TARGET_SIGMASK
-void set_sigmask(const sigset_t *set)
+void target_set_sigmask(const target_sigset_t *target_set)
 {
     TaskState *ts = (TaskState *)thread_cpu->opaque;
 
-    ts->signal_mask = *set;
-}
-#else
-void target_set_sigmask(const sigset_t *set,
-                        const target_sigset_t *target_set)
-{
-    TaskState *ts = (TaskState *)thread_cpu->opaque;
-
-    ts->signal_mask = *set;
     ts->target_signal_mask = *target_set;
-#ifdef MUX_SIG
-    /* MUX_SIG can't be blocked on host */
-    sigdelset(&ts->signal_mask, MUX_SIG);
-#endif
 }
-#endif
-#endif
 
 /* sigaltstack management */
 
@@ -833,7 +987,6 @@ static void host_signal_handler(int host_signum, siginfo_t *info,
     if (sig < 1 || sig > TARGET_NSIG)
         return;
 
-#ifdef MUX_SIG
     if (sig == MUX_SIG) {
         /* return the spoofed kill/tgkill signals into standard form */
         if (info->si_code == SIG_SPOOF(SI_USER)) {
@@ -848,12 +1001,8 @@ static void host_signal_handler(int host_signum, siginfo_t *info,
          * the wrong number (most likely to MUX_SIG).
          */
         /* get the actual target signal number */
-        int target_sig = info->si_errno;
-        if (target_sig >= _NSIG && target_sig < TARGET_NSIG) {
-            sig = target_sig;
-        }
+        sig = info->si_errno;
     }
-#endif
     trace_user_host_signal(env, host_signum, sig);
 
     rewind_if_in_safe_syscall(puc);
@@ -1034,12 +1183,9 @@ int do_sigaction(int sig, const struct target_sigaction *act,
 
         /* we update the host linux signal state */
         host_sig = target_to_host_signal(sig);
-#ifdef MUX_SIG
-        /* put the out of host range signal into the multiplex */
-        if (sig >= _NSIG && sig < TARGET_NSIG) {
-            host_sig = MUX_SIG;
-        }
-#endif
+        // XXX: Is it OK for MUX_SIG to get set like this? Does allowing the
+        // guest to control SA_RESTART, or the _sa_handler cause any problems?
+        // This seems not ideal.
         if (host_sig != SIGSEGV && host_sig != SIGBUS) {
             sigfillset(&act1.sa_mask);
             act1.sa_flags = SA_SIGINFO;
@@ -1069,11 +1215,8 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
 {
     CPUState *cpu = env_cpu(cpu_env);
     abi_ulong handler;
-    sigset_t set;
     target_sigset_t target_old_set;
-#ifdef TRACK_TARGET_SIGMASK
     target_sigset_t target_set;
-#endif
     struct target_sigaction *sa;
     TaskState *ts = cpu->opaque;
 
@@ -1108,40 +1251,39 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
         dump_core_and_abort(sig);
     } else {
         /* compute the blocked signals during the handler execution */
-        sigset_t *blocked_set;
-#ifdef TRACK_TARGET_SIGMASK
         target_sigset_t *target_blocked_set;
 
         tswapal_target_sigset(&target_set, &sa->sa_mask);
-#endif
-        target_to_host_sigset(&set, &sa->sa_mask);
         /* SA_NODEFER indicates that the current signal should not be
            blocked during the handler */
         if (!(sa->sa_flags & TARGET_SA_NODEFER)) {
-#ifdef TRACK_TARGET_SIGMASK
             target_sigaddset(&target_set, sig);
-#endif
-            sigaddset(&set, target_to_host_signal(sig));
         }
 
         /* save the previous blocked signal state to restore it at the
            end of the signal execution (see do_sigreturn) */
-#ifdef TRACK_TARGET_SIGMASK
         target_old_set = ts->target_signal_mask;
-#else
-        host_to_target_sigset_internal(&target_old_set, &ts->signal_mask);
-#endif
 
-        /* block signals in the handler */
-        blocked_set = ts->in_sigsuspend ?
-            &ts->sigsuspend_mask : &ts->signal_mask;
-        sigorset(&ts->signal_mask, blocked_set, &set);
-#ifdef TRACK_TARGET_SIGMASK
-        target_blocked_set = ts->in_sigsuspend ?
-            &ts->target_sigsuspend_mask : &ts->target_signal_mask;
+        if (ts->in_sigsuspend) {
+          target_blocked_set = &ts->target_sigsuspend_mask;
+          // If we receive an unblocked signal, we're no longer in sigsuspend,
+          // otherwise, we're still in sigsuspend.
+          if (!target_sigismember(&ts->target_suspend_mask, sig)) {
+            ts->in_sigsuspend = 0;
+          }
+        } else {
+          target_blocked_set = &ts->target_signal_mask;
+        }
+
         target_sigorset(&ts->target_signal_mask, target_blocked_set,
                         &target_set);
-#endif
+
+        /* block signals in the handler */
+        target_blocked_set = ts->in_sigsuspend ?
+            &ts->target_sigsuspend_mask : &ts->target_signal_mask;
+        if (ts->in_sigsuspend && target_sigismember(&target
+        if (target_sigismember(&target
+        // XXX,FIXME: this is not always the case, if s
         ts->in_sigsuspend = 0;
 
         /* if the CPU is in VM86 mode, we restore the 32 bit values */
@@ -1169,17 +1311,76 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
     }
 }
 
+enum pending_check {
+  SIG_IN_SET,
+  SIG_NOT_IN_SET,
+};
+
+static bool check_pending_set(CPUArchState *env, target_sigset_t *set, enum pending_check check) {
+    CPUState *cpu = env_cpu(env);
+    TaskState *ts = cpu->opaque;
+
+    for (int sig = 1; sig <= TARGET_NSIG; sig++) {
+      struct emulated_sigtable *k = &ts->sigtab[sig - 1];
+
+      if (QSIMPLEQ_EMPTY(&k->queue))
+        continue;
+
+      switch (check) {
+      case SIG_IN_SET:
+        if (target_sigismember(set, sig))
+          return true;
+      case SIG_NOT_IN_SET:
+        if (!target_sigismember(set, sig))
+          return true;
+      }
+    }
+
+    return false;
+}
+
+bool have_pending_sig_in_set(CPUArchState *env, target_sigset_t *set) {
+  return check_pending_set(env, set, SIG_IN_SET);
+}
+
+bool have_pending_sig_not_in_set(CPUArchState *env, target_sigset_t *set) {
+  return check_pending_set(env, set, SIG_NOT_IN_SET);
+}
+
+struct emulated_sigqueue * pop_pending_sig_in_set(CPUArchState *env, target_sigset_t *set) {
+    for (sig = 1; sig <= TARGET_NSIG; sig++) {
+        struct emulated_sigtable *k = &ts->sigtab[sig - 1];
+
+        if (QSIMPLEQ_EMPTY(&k->queue) || !target_sigismember(set, sig))
+          continue;
+
+        struct emulated_sigqueue *event = QSIMPLEQ_FIRST(&k->queue);
+        QSIMPLEQ_REMOVE_HEAD(&k->queue, next);
+
+        return event;
+    }
+    return NULL;
+}
+
+static void resume_sigsuspend() {
+    CPUArchState *env = thread_cpu->env_ptr;
+    CPUState *cpu = env_cpu(env);
+    TaskState *ts = cpu->opaque;
+
+
+    // XXX: look at do_syscall, lots of tracking we need to look at.
+    //do_strace?
+    //whatabout RESTARTSYS? Can we just return that directly to the user?
+    //Should be OK, if they haven't set SA_NORESTART.
+}
+
 void process_pending_signals(CPUArchState *cpu_env)
 {
     CPUState *cpu = env_cpu(cpu_env);
     int sig;
     TaskState *ts = cpu->opaque;
     sigset_t set;
-#ifdef TRACK_TARGET_SIGMASK
     target_sigset_t *target_blocked_set;
-#else
-    sigset_t *blocked_set;
-#endif
 
     while (atomic_read(&ts->signal_pending)) {
         /* FIXME: This is not threadsafe.  */
@@ -1197,21 +1398,11 @@ void process_pending_signals(CPUArchState *cpu_env)
              * to block a synchronous signal since it could then just end up
              * looping round and round indefinitely.
              */
-#ifdef TRACK_TARGET_SIGMASK
-            if (sigismember(&ts->signal_mask, target_to_host_signal(sig)) == 1
-                || target_sigismember(&ts->target_signal_mask, sig) == 1
+            if (target_sigismember(&ts->target_signal_mask, sig) == 1
                 || sigact_table[sig - 1]._sa_handler == TARGET_SIG_IGN) {
-                sigdelset(&ts->signal_mask, target_to_host_signal(sig));
                 target_sigdelset(&ts->target_signal_mask, sig);
                 sigact_table[sig - 1]._sa_handler = TARGET_SIG_DFL;
             }
-#else
-            if (sigismember(&ts->signal_mask, target_to_host_signal_table[sig])
-                || sigact_table[sig - 1]._sa_handler == TARGET_SIG_IGN) {
-                sigdelset(&ts->signal_mask, target_to_host_signal_table[sig]);
-                sigact_table[sig - 1]._sa_handler = TARGET_SIG_DFL;
-            }
-#endif
 
             handle_pending_signal(cpu_env, sig, &ts->sync_signal.event);
             // mark the sync signal as completed.
@@ -1221,31 +1412,22 @@ void process_pending_signals(CPUArchState *cpu_env)
         }
 
         for (sig = 1; sig <= TARGET_NSIG; sig++) {
-#ifdef TRACK_TARGET_SIGMASK
             target_blocked_set = ts->in_sigsuspend ?
                 &ts->target_sigsuspend_mask : &ts->target_signal_mask;
-#else
-            blocked_set = ts->in_sigsuspend ?
-                &ts->sigsuspend_mask : &ts->signal_mask;
-#endif
 
             struct emulated_sigtable *k = &ts->sigtab[sig - 1];
 
-#ifdef TRACK_TARGET_SIGMASK
+            if (!QSIMPLEQ_EMPTY(&k->queue) &&
+                target_sigismember(target_blocked_set, sig) && ts->in_suspend) {
+                // We've received a signal blocked by the target_suspend_mask,
+                // but not by the host suspend mask. It must be a 
+                do_suspend(...);
+                goto restart_scan;
+            }
+
             if (QSIMPLEQ_EMPTY(&k->queue) ||
                 target_sigismember(target_blocked_set, sig))
               continue;
-            if (QSIMPLEQ_EMPTY(&k->queue) ||
-                sigismember(blocked_set,
-                            target_to_host_signal_table[sig]))
-              continue;
-#else
-            if (QSIMPLEQ_EMPTY(&k->queue) ||
-                sigismember(blocked_set,
-                            target_to_host_signal_table[sig]))
-              continue;
-#endif
-
 
             // Dequeue and handle a pending signal.
             // Note: we don't need to loop over all signals, because
@@ -1270,13 +1452,12 @@ void process_pending_signals(CPUArchState *cpu_env)
          */
         atomic_set(&ts->signal_pending, 0);
         ts->in_sigsuspend = 0;
+        // XXX: This actually needs to be based on target_sigmask?
         set = ts->signal_mask;
         sigdelset(&set, SIGSEGV);
         sigdelset(&set, SIGBUS);
-#ifdef MUX_SIG
         /* MUX_SIG can't be blocked on host */
         sigdelset(&ts->signal_mask, MUX_SIG);
-#endif
         sigprocmask(SIG_SETMASK, &set, 0);
     }
     ts->in_sigsuspend = 0;

@@ -406,32 +406,30 @@ struct target_dirent64 {
 #define TARGET_NSIG_BPW	   TARGET_ABI_BITS
 #define TARGET_NSIG_WORDS  (TARGET_NSIG / TARGET_NSIG_BPW)
 
-#if _NSIG <= TARGET_NSIG
 /*
  * MUX_SIG is used as a multiplex signal number - signals that are
- * out of the host range and in the target range are sent through it.
- * It is defined as the maximal available real-time signal in order to
- * comply with the rule that low-numbered signals have highest priority.
- * (signals using it will have the same priority but it will be smaller
- * than all the other real-time signals)
- * SIGRMTAX is avoided so it doesn't interfere with the hack of reversing
- * __SIGRTMIN and __SIGRTMAX in the host_to_target_signal_table.
+ * out of the host range and in the target range, or reserved by glibc  are
+ * sent through it. It is defined as the maximal available real-time signal
+ * in order to comply with the rule that low-numbered signals have highest
+ * priority. (signals using it will have the same priority but it will be
+ * smaller than all the other real-time signals).
  */
-#define MUX_SIG     (SIGRTMAX - 1)
-
-/*
- * The target signal masks must be tracked since they are larger than
- * the host signal masks.
- */
-#define TRACK_TARGET_SIGMASK
+#define MUX_SIG   (SIGRTMAX)
 
 /*
  * This macro is used to change a kill/tgkill signal so it can be sent through
  * rt_sigqueueinfo()/rt_tgsigqueueinfo(), since the host kernel doesn't allow
  * direct impersonations of those signals. Subtracting 8 from the code moves
- * it to the nearest unused kernel si_code value.
+ * it to the nearest unused kernel si_code value as of Linux 5.0.
  */
 #define SIG_SPOOF(code)  ((code) - 8)
+
+#if _NSIG <= TARGET_NSIG
+/*
+ * The target signal masks must be tracked since they are larger than
+ * the host signal masks.
+ */
+#define TRACK_TARGET_SIGMASK
 #endif
 
 typedef struct {
