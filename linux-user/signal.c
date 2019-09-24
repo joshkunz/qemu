@@ -488,12 +488,19 @@ void signal_init(void)
     int i, j;
     int host_sig;
 
+    // Mark that there are no pending sync signals.
+    ts->sync_signal.signal = 0;
+    ts->sigqueue_start_scan = 0;
+    for (i = 0; i < MAX_SIGQUEUE_SIZE; i++) {
+      ts->sigqueue_slots[i].used = false;
+    }
+
     /* generate signal conversion tables */
-    for(i = 1; i < _NSIG; i++) {
+    for (i = 1; i < _NSIG; i++) {
         if (host_to_target_signal_table[i] == 0)
             host_to_target_signal_table[i] = i;
     }
-    for(i = 1; i < _NSIG; i++) {
+    for (i = 1; i < _NSIG; i++) {
         j = host_to_target_signal_table[i];
         target_to_host_signal_table[j] = i;
     }
@@ -508,12 +515,15 @@ void signal_init(void)
     sigfillset(&act.sa_mask);
     act.sa_flags = SA_SIGINFO;
     act.sa_sigaction = host_signal_handler;
-    for(i = 1; i <= TARGET_NSIG; i++) {
+    for (i = 1; i <= TARGET_NSIG; i++) {
 #ifdef TARGET_GPROF
         if (i == SIGPROF) {
             continue;
         }
 #endif
+        QSIMPLEQ_INIT(&ts->sigtab[i - 1].queue);
+        ts->sigtab[i - 1].first.used = false;
+
         host_sig = target_to_host_signal(i);
         sigaction(host_sig, NULL, &oact);
         if (oact.sa_sigaction == (void *)SIG_IGN) {
@@ -634,8 +644,8 @@ int queue_signal(CPUArchState *env, int sig, int si_type,
 
     info->si_code = deposit32(info->si_code, 16, 16, si_type);
 
-    ts->sync_signal.info = *info;
-    ts->sync_signal.pending = sig;
+    ts->sync_signal.signal = sig;
+    ts->sync_signal.event.info = *info;
     /* signal that a new signal is pending */
     atomic_set(&ts->signal_pending, 1);
     return 1; /* indicates that the signal was queued */
@@ -647,6 +657,20 @@ static inline void rewind_if_in_safe_syscall(void *puc)
     /* Default version: never rewind */
 }
 #endif
+
+static struct emulated_sigqueue * find_sigqueue_slot(TaskState *ts) {
+  int start = ts->sigqueue_start_scan;
+  for (int i = 0; i < MAX_SIGQUEUE_SIZE; i++) {
+    int slot_idx = (start + i) % MAX_SIGQUEUE_SIZE;
+    struct emulated_sigqueue *slot = &ts->sigqueue_slots[slot_idx];
+    if (!slot->used) {
+      slot->used = true;
+      ts->sigqueue_start_scan = (slot_idx + 1) % MAX_SIGQUEUE_SIZE;
+      return slot;
+    }
+  }
+  return NULL;
+}
 
 static void host_signal_handler(int host_signum, siginfo_t *info,
                                 void *puc)
@@ -678,8 +702,43 @@ static void host_signal_handler(int host_signum, siginfo_t *info,
 
     host_to_target_siginfo_noswap(&tinfo, info);
     k = &ts->sigtab[sig - 1];
-    k->info = tinfo;
-    k->pending = sig;
+
+    // No need to worry about atomics here, because we've masked off all
+    // other signals, and we're only touching thread-local datastructures.
+    struct emulated_sigqueue *item = NULL;
+    if (info->si_code == SI_QUEUE) {
+      // Either this is the first item we're putting in the queue,
+      // or we need to grab a sigqueue_slot from the global sigqueue
+      // table.
+      if (!k->first.used) {
+        item = &k->first;
+      } else {
+        item = find_sigqueue_slot(ts);
+        if (item == NULL) {
+          qemu_log("ERROR: dropping signal %d, can't find free sigqueue slot.", sig);
+          return;
+        }
+      }
+    } else {
+      // If we're not in an SI_QUEUE type event, then free up any
+      // queued signals (there should never be more than 1), and
+      // reset the queue.
+      struct emulated_sigqueue *slot;
+      QSIMPLEQ_FOREACH(slot, &k->queue, next) {
+        slot->used = false;
+      }
+      QSIMPLEQ_INIT(&k->queue);
+      // k->first can only be used in this signal's queue, and we just
+      // free'd all the slots. So either this item wasn't used (queue was
+      // empty), or we free'd it.
+      assert(!k->first.used);
+      item = &k->first;
+    }
+
+    item->used = true;
+    item->info = tinfo;
+    QSIMPLEQ_INSERT_TAIL(&k->queue, &k->first, next);
+
     ts->signal_pending = 1;
 
     /* Block host signals until target signal handler entered. We
@@ -842,7 +901,7 @@ int do_sigaction(int sig, const struct target_sigaction *act,
 }
 
 static void handle_pending_signal(CPUArchState *cpu_env, int sig,
-                                  struct emulated_sigtable *k)
+                                  struct emulated_sigqueue * event)
 {
     CPUState *cpu = env_cpu(cpu_env);
     abi_ulong handler;
@@ -852,8 +911,6 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
     TaskState *ts = cpu->opaque;
 
     trace_user_handle_signal(cpu_env, sig);
-    /* dequeue signal */
-    k->pending = 0;
 
     sig = gdb_handlesig(cpu, sig);
     if (!sig) {
@@ -865,7 +922,7 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
     }
 
     if (do_strace) {
-        print_taken_signal(sig, &k->info);
+        print_taken_signal(sig, &event->info);
     }
 
     if (handler == TARGET_SIG_DFL) {
@@ -913,13 +970,13 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
         /* prepare the stack frame of the virtual CPU */
 #if defined(TARGET_ARCH_HAS_SETUP_FRAME)
         if (sa->sa_flags & TARGET_SA_SIGINFO) {
-            setup_rt_frame(sig, sa, &k->info, &target_old_set, cpu_env);
+            setup_rt_frame(sig, sa, &event->info, &target_old_set, cpu_env);
         } else {
             setup_frame(sig, sa, &target_old_set, cpu_env);
         }
 #else
         /* These targets do not have traditional signals.  */
-        setup_rt_frame(sig, sa, &k->info, &target_old_set, cpu_env);
+        setup_rt_frame(sig, sa, &event->info, &target_old_set, cpu_env);
 #endif
         if (sa->sa_flags & TARGET_SA_RESETHAND) {
             sa->_sa_handler = TARGET_SIG_DFL;
@@ -941,7 +998,7 @@ void process_pending_signals(CPUArchState *cpu_env)
         sigprocmask(SIG_SETMASK, &set, 0);
 
     restart_scan:
-        sig = ts->sync_signal.pending;
+        sig = ts->sync_signal.signal;
         if (sig) {
             /* Synchronous signals are forced,
              * see force_sig_info() and callers in Linux
@@ -957,22 +1014,39 @@ void process_pending_signals(CPUArchState *cpu_env)
                 sigact_table[sig - 1]._sa_handler = TARGET_SIG_DFL;
             }
 
-            handle_pending_signal(cpu_env, sig, &ts->sync_signal);
+            handle_pending_signal(cpu_env, sig, &ts->sync_signal.event);
+            // mark the sync signal as completed.
+            ts->sync_signal.signal = 0;
+            // XXX: Why not restart scan here? Can sync signals generate other
+            // sync signals.
         }
 
         for (sig = 1; sig <= TARGET_NSIG; sig++) {
             blocked_set = ts->in_sigsuspend ?
                 &ts->sigsuspend_mask : &ts->signal_mask;
 
-            if (ts->sigtab[sig - 1].pending &&
-                (!sigismember(blocked_set,
-                              target_to_host_signal_table[sig]))) {
-                handle_pending_signal(cpu_env, sig, &ts->sigtab[sig - 1]);
-                /* Restart scan from the beginning, as handle_pending_signal
-                 * might have resulted in a new synchronous signal (eg SIGSEGV).
-                 */
-                goto restart_scan;
-            }
+            struct emulated_sigtable *k = &ts->sigtab[sig - 1];
+
+            if (QSIMPLEQ_EMPTY(&k->queue) ||
+                sigismember(blocked_set,
+                            target_to_host_signal_table[sig]))
+              continue;
+
+            // Dequeue and handle a pending signal.
+            // Note: we don't need to loop over all signals, because
+            // restart_scan will fall back into this loop.
+            struct emulated_sigqueue *event = QSIMPLEQ_FIRST(&k->queue);
+            QSIMPLEQ_REMOVE_HEAD(&k->queue, next);
+
+            handle_pending_signal(cpu_env, sig, event);
+
+            // Release the sigqueue slot to be used again later.
+            event->used = false;
+
+            /* Restart scan from the beginning, as handle_pending_signal
+             * might have resulted in a new synchronous signal (eg SIGSEGV).
+             */
+            goto restart_scan;
         }
 
         /* if no signal is pending, unblock signals and recheck (the act

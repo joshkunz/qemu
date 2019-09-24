@@ -90,10 +90,23 @@ struct vm86_saved_state {
 
 #define MAX_SIGQUEUE_SIZE 1024
 
-struct emulated_sigtable {
-    int pending; /* true if signal is pending */
+struct emulated_sigqueue {
+    bool used;   // true if this sigqueue is used.
     target_siginfo_t info;
+    QSIMPLEQ_ENTRY(emulated_sigqueue) next;
 };
+
+struct emulated_sigtable {
+    QSIMPLEQ_HEAD(, emulated_sigqueue) queue;
+    // "first" is the 
+    struct emulated_sigqueue first;
+};
+
+struct sync_signal {
+  int signal;
+  struct emulated_sigqueue event;
+};
+
 
 /* NOTE: we force a big alignment so that the stack stored after is
    aligned too */
@@ -127,8 +140,11 @@ typedef struct TaskState {
     struct image_info *info;
     struct linux_binprm *bprm;
 
-    struct emulated_sigtable sync_signal;
+    struct sync_signal sync_signal;
     struct emulated_sigtable sigtab[TARGET_NSIG];
+    struct emulated_sigqueue sigqueue_slots[MAX_SIGQUEUE_SIZE];
+    // The start position for the next scan looking for a free sigqueue slot.
+    int sigqueue_start_scan;
     /* This thread's signal mask, as requested by the guest program.
      * The actual signal mask of this thread may differ:
      *  + we don't let SIGSEGV and SIGBUS be blocked while running guest code
